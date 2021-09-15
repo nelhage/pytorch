@@ -9,7 +9,6 @@ from torch.fx.experimental.fx_acc.acc_normalizer import (
     register_acc_op_mapping,
     register_custom_acc_mapper_fn,
 )
-from torch.fx.passes.shape_prop import _extract_tensor_metadata
 
 from typing import Sequence, Optional, List
 
@@ -359,6 +358,51 @@ def matmul(*, input, other):
     return torch.matmul(**locals())
 
 
+@register_custom_acc_mapper_fn(
+    op_and_target=("call_function", torch.min),
+    arg_replacement_tuples=[
+        ("input", "input"),
+        ("other", "other", this_arg_is_optional),
+        ("dim", "dim", this_arg_is_optional),
+        ("keepdim", "keepdim", this_arg_is_optional),
+    ],
+)
+def custom_torch_min_mapper(node: torch.fx.Node, mod: nn.Module) -> torch.fx.Node:
+    """
+    Add custom mapping for torch.min because torch.min has three input types, where each yields a different output type:
+        1. torch.min(input); Output: tensor wih the minimum number
+        2. torch.min(input, other); Output: tensor with coordinate-wise min value
+        3[Not Supported] torch.min(input, dim, keepdim); Output:(min_values，and min_indices)
+    """
+    with node.graph.inserting_before(node):
+        # If dim is in kwargs, assert "Not Supported"
+        assert "dim" not in node.kwargs, "Currently not support dim in torch.min"
+
+        if "other" in node.kwargs and node.kwargs["other"] is not None:
+            # If kwargs[other] is a valid tensor, call min_two_tensors_input,
+            op_func = min_two_tensors_input
+        else:
+            # Otherwise, call min_single_tensor_input
+            op_func = min_single_tensor_input
+
+        new_node = node.graph.create_node(
+            "call_function",
+            op_func,
+            kwargs=node.kwargs,
+            name=node.name,
+        )
+        new_node.meta = node.meta
+        return new_node
+
+
+@register_acc_op
+def min_single_tensor_input(*, input):
+    return torch.min(input)
+
+
+@register_acc_op
+def min_two_tensors_input(*, input, other):
+    return torch.min(input, other)
 
 @register_acc_op_mapping(
     op_and_target=("call_function", torch.ops.quantized.add),
@@ -369,18 +413,20 @@ def matmul(*, input, other):
         ("zero_point", "zero_point"),
     ],
     kwargs_to_move_to_acc_out_ty=[
-        ("scale", "q_scale"),
-        ("zero_point", "q_zero_point"),
+        ("scale", "scale"),
+        ("zero_point", "zero_point"),
     ],
+    qscheme=torch.per_tensor_affine,
 )
 @register_acc_op
 def quantized_add(*, input, other, acc_out_ty=None):
     assert acc_out_ty is not None
+    qparams = acc_utils.get_field_from_acc_out_ty(acc_out_ty, "qparams")
     return torch.ops.quantized.add(
         input,
         other,
-        acc_utils.get_field_from_acc_out_ty(acc_out_ty, "q_scale"),
-        acc_utils.get_field_from_acc_out_ty(acc_out_ty, "q_zero_point"),
+        qparams["scale"],
+        qparams["zero_point"],
     )
 
 
@@ -393,20 +439,21 @@ def quantized_add(*, input, other, acc_out_ty=None):
         ("zero_point", "zero_point"),
     ],
     kwargs_to_move_to_acc_out_ty=[
-        ("scale", "q_scale"),
-        ("zero_point", "q_zero_point"),
+        ("scale", "scale"),
+        ("zero_point", "zero_point"),
     ],
+    qscheme=torch.per_tensor_affine,
 )
 @register_acc_op
 def quantized_mul(*, input, other, acc_out_ty=None):
     assert acc_out_ty is not None
+    qparams = acc_utils.get_field_from_acc_out_ty(acc_out_ty, "qparams")
     return torch.ops.quantized.mul(
         input,
         other,
-        acc_utils.get_field_from_acc_out_ty(acc_out_ty, "q_scale"),
-        acc_utils.get_field_from_acc_out_ty(acc_out_ty, "q_zero_point"),
+        qparams["scale"],
+        qparams["zero_point"],
     )
-
 
 @register_acc_op_mapping(
     op_and_target=("call_function", torch.quantize_per_tensor),
@@ -414,24 +461,54 @@ def quantized_mul(*, input, other, acc_out_ty=None):
         ("input", "input"),
         ("scale", "scale"),
         ("zero_point", "zero_point"),
-        ("dtype", "dtype"),
+        ("dtype", "dtype")
     ],
     kwargs_to_move_to_acc_out_ty=[
-        ("dtype", "dtype"),
-        ("scale", "q_scale"),
-        ("zero_point", "q_zero_point"),
+        ("scale", "scale"),
+        ("zero_point", "zero_point"),
+        ("dtype", "dtype")
     ],
+    qscheme=torch.per_tensor_affine,
 )
 @register_acc_op
 def quantize_per_tensor(*, input, acc_out_ty=None):
     assert acc_out_ty is not None
+    qparams = acc_utils.get_field_from_acc_out_ty(acc_out_ty, "qparams")
     return torch.quantize_per_tensor(
         input,
-        acc_utils.get_field_from_acc_out_ty(acc_out_ty, "q_scale"),
-        acc_utils.get_field_from_acc_out_ty(acc_out_ty, "q_zero_point"),
-        acc_utils.get_field_from_acc_out_ty(acc_out_ty, "dtype"),
+        qparams["scale"],
+        qparams["zero_point"],
+        qparams["dtype"]
     )
 
+@register_acc_op_mapping(
+    op_and_target=("call_function", torch.quantize_per_channel),
+    arg_replacement_tuples=[
+        ("input", "input"),
+        ("scales", "scales"),
+        ("zero_points", "zero_points"),
+        ("axis", "axis"),
+        ("dtype", "dtype")
+    ],
+    kwargs_to_move_to_acc_out_ty=[
+        ("scales", "scale"),
+        ("zero_points", "zero_point"),
+        ("axis", "axis"),
+        ("dtype", "dtype")
+    ],
+    qscheme=torch.per_channel_affine,
+)
+@register_acc_op
+def quantize_per_channel(*, input, acc_out_ty=None):
+    assert acc_out_ty is not None
+    qparams = acc_utils.get_field_from_acc_out_ty(acc_out_ty, "qparams")
+    return torch.quantize_per_tensor(
+        input,
+        qparams["scale"],
+        qparams["zero_point"],
+        qparams["axis"],
+        qparams["dtype"]
+    )
 
 @register_acc_op
 def dequantize(*, input, input_tensor_meta):
@@ -917,6 +994,7 @@ def tuple_construct(*, tensors):
         ("scale", "q_scale"),
         ("zero_point", "q_zero_point"),
     ],
+    qscheme=torch.per_tensor_affine,
 )
 @register_acc_op
 def quantized_batch_norm2d(
